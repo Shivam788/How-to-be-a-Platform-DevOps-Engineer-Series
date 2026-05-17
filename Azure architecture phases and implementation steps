@@ -1,5 +1,3 @@
-***
-
 ## **Phase 1: Define the Foundation (Requirements & Architecture)**
 
 ### Step 1: Understand the business and technical requirements [us.nttdata](https://us.nttdata.com/en/blog/2021/june/design-principles-for-azure-landing-zones)
@@ -30,7 +28,7 @@ For most enterprises, **hub-spoke** is the right choice because:
 - It scales well for 5–20 spokes (application landing zones).
 
 **Hub-Spoke Design:**
-- **Hub VNet**: Centralized network containing shared services (Azure Firewall, VPN Gateway, Bastion, DNS forwarders, monitoring).
+- **Hub VNet**: Centralised network containing shared services (Azure Firewall, VPN Gateway, Bastion, DNS forwarders, monitoring).
 - **Spoke VNets**: One per team or application workload, isolated from each other.
 - **VNet Peering**: Hub ↔ Spoke connectivity with gateway transit enabled. [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
 
@@ -66,7 +64,7 @@ Root Management Group
 ```
 
 **Why this matters:**
-- Azure Policies applied at management group level cascade down.
+- Azure Policies applied at the management group level cascade down.
 - Billing and cost tracking are easier per subscription.
 - Each subscription can have different RBAC and governance. [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
 
@@ -76,7 +74,7 @@ Root Management Group
 
 ***
 
-## **Phase 2: Build the Hub Network (Centralized Shared Services)**
+## **Phase 2: Build the Hub Network (Centralised Shared Services)**
 
 ### Step 4: Provision the hub VNet and subnets [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
 
@@ -782,5 +780,3 @@ resource "azurerm_monitor_diagnostic_setting" "firewall" {
 4. **Resilience**: Multi-region ARO + Traffic Manager ensure failover capability.
 5. **Cost governance**: Budgets, right-sizing, and auto-shutdown prevent waste.
 6. **Observability**: Centralised logging and monitoring detect issues early.
-
-***
