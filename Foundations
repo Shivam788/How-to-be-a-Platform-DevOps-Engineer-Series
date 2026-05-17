@@ -1,0 +1,786 @@
+***
+
+## **Phase 1: Define the Foundation (Requirements & Architecture)**
+
+### Step 1: Understand the business and technical requirements [us.nttdata](https://us.nttdata.com/en/blog/2021/june/design-principles-for-azure-landing-zones)
+
+Before writing any code or creating any resources, gather requirements:
+
+**Questions to answer:**
+- How many teams will use this platform?
+- What applications will run (microservices, legacy apps, databases)?
+- What are the compliance requirements? (finance, healthcare, PCI-DSS, etc.)
+- What are the availability targets? (99.9%, 99.95%, 99.99%)
+- What regions are needed? (for latency, data residency, disaster recovery)
+- What is the connectivity model? (internet-facing, private only, hybrid cloud)
+- What are the cost constraints?
+
+**Output:**
+- A one-page requirements doc covering workload types, compliance needs, availability targets, and regions.
+
+***
+
+### Step 2: Choose the network topology [learn.microsoft](https://learn.microsoft.com/en-us/azure/architecture/networking/architecture/hub-spoke)
+
+**Decision: Hub-Spoke vs. Virtual WAN**
+
+For most enterprises, **hub-spoke** is the right choice because:
+- It's simpler and cheaper than Virtual WAN.
+- It gives you full control over routing and security.
+- It scales well for 5–20 spokes (application landing zones).
+
+**Hub-Spoke Design:**
+- **Hub VNet**: Centralized network containing shared services (Azure Firewall, VPN Gateway, Bastion, DNS forwarders, monitoring).
+- **Spoke VNets**: One per team or application workload, isolated from each other.
+- **VNet Peering**: Hub ↔ Spoke connectivity with gateway transit enabled. [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
+
+**IP Address Planning:**
+- Reserve a large CIDR block (e.g., `10.0.0.0/8`).
+- Allocate subnets logically:
+  - Hub: `10.0.0.0/16`
+  - Spoke 1: `10.1.0.0/16`
+  - Spoke 2: `10.2.0.0/16`
+  - OpenShift Cluster 1: `10.10.0.0/16`
+  - OpenShift Cluster 2: `10.20.0.0/16`
+
+**Output:**
+- Network diagram showing hub, spokes, and peering.
+- IP address allocation table.
+
+***
+
+### Step 3: Design the subscription and management group structure [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
+
+**Management Group Hierarchy:**
+```
+Root Management Group
+├── Platform (shared services)
+│   ├── Connectivity (hub networking, firewall)
+│   ├── Identity (Active Directory, DNS)
+│   └── Management (monitoring, backup)
+├── Landing Zones (workloads)
+│   ├── Corp (internal apps)
+│   ├── Online (internet-facing apps)
+│   └── OpenShift (container platform)
+└── Sandbox (dev/test, less strict policies)
+```
+
+**Why this matters:**
+- Azure Policies applied at management group level cascade down.
+- Billing and cost tracking are easier per subscription.
+- Each subscription can have different RBAC and governance. [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
+
+**Output:**
+- Management group structure diagram.
+- Subscription naming convention (e.g., `sub-corp-prod-001`, `sub-openshift-aro-eastus`).
+
+***
+
+## **Phase 2: Build the Hub Network (Centralized Shared Services)**
+
+### Step 4: Provision the hub VNet and subnets [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
+
+**Using Terraform (modular approach):**
+
+Create a Terraform module for the hub network:
+
+```hcl
+# modules/hub-network/main.tf
+resource "azurerm_virtual_network" "hub" {
+  name                = var.hub_vnet_name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  address_space       = ["10.0.0.0/16"]
+}
+
+resource "azurerm_subnet" "firewall" {
+  name                 = "AzureFirewallSubnet"  # Must be this exact name
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.hub.name
+  address_prefixes     = ["10.0.1.0/26"]
+}
+
+resource "azurerm_subnet" "gateway" {
+  name                 = "GatewaySubnet"  # Must be this exact name
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.hub.name
+  address_prefixes     = ["10.0.2.0/27"]
+}
+
+resource "azurerm_subnet" "bastion" {
+  name                 = "AzureBastionSubnet"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.hub.name
+  address_prefixes     = ["10.0.3.0/27"]
+}
+```
+
+**Why:**
+- Azure Firewall and Gateway subnets have mandatory naming requirements.
+- Bastion provides secure RDP/SSH access without public IPs on VMs. [learn.microsoft](https://learn.microsoft.com/en-us/azure/architecture/networking/architecture/hub-spoke)
+
+***
+
+### Step 5: Deploy Azure Firewall for centralized egress control [learn.microsoft](https://learn.microsoft.com/en-us/azure/architecture/networking/architecture/hub-spoke)
+
+```hcl
+# modules/hub-network/firewall.tf
+resource "azurerm_firewall" "hub" {
+  name                = var.firewall_name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  sku_name            = "AZFW_VNet"
+  sku_tier            = "Standard"
+
+  ip_configuration {
+    name                 = "firewall-ipconfig"
+    subnet_id            = azurerm_subnet.firewall.id
+    public_ip_address_id = azurerm_public_ip.firewall.id
+  }
+}
+
+resource "azurerm_firewall_policy" "hub" {
+  name                = "${var.firewall_name}-policy"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+}
+```
+
+**Why:**
+- All outbound internet traffic from spokes routes through the hub firewall.
+- Centralized logging and threat detection.
+- Prevents data exfiltration. [learn.microsoft](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/plan-for-landing-zone-network-segmentation)
+
+***
+
+### Step 6: Configure User-Defined Routes (UDRs) to force traffic through firewall [learn.microsoft](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/plan-for-landing-zone-network-segmentation)
+
+```hcl
+resource "azurerm_route_table" "spoke" {
+  name                = "rt-spoke-to-hub"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  route {
+    name                   = "default-route"
+    address_prefix         = "0.0.0.0/0"
+    next_hop_type          = "VirtualAppliance"
+    next_hop_in_ip_address = azurerm_firewall.hub.ip_configuration[0].private_ip_address
+  }
+}
+```
+
+**Why:**
+- Forces all internet-bound traffic from spoke VNets to go through Azure Firewall for inspection. [learn.microsoft](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/plan-for-landing-zone-network-segmentation)
+
+***
+
+## **Phase 3: Build Spoke Networks (Application Landing Zones)**
+
+### Step 7: Create spoke VNets with VNet peering to hub [azuresecurityarchitect](https://azuresecurityarchitect.com/azure-landing-zone/building-an-azure-landing-zone-in-an-existing-hub-and-spoke-architecture/)
+
+```hcl
+# modules/spoke-network/main.tf
+resource "azurerm_virtual_network" "spoke" {
+  name                = var.spoke_vnet_name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  address_space       = [var.address_space]
+}
+
+resource "azurerm_virtual_network_peering" "spoke_to_hub" {
+  name                      = "peer-spoke-to-hub"
+  resource_group_name       = var.resource_group_name
+  virtual_network_name      = azurerm_virtual_network.spoke.name
+  remote_virtual_network_id = var.hub_vnet_id
+  allow_forwarded_traffic   = true
+  allow_gateway_transit     = false
+  use_remote_gateways       = true  # Use hub's VPN gateway
+}
+
+resource "azurerm_virtual_network_peering" "hub_to_spoke" {
+  name                      = "peer-hub-to-spoke"
+  resource_group_name       = var.hub_resource_group_name
+  virtual_network_name      = var.hub_vnet_name
+  remote_virtual_network_id = azurerm_virtual_network.spoke.id
+  allow_forwarded_traffic   = true
+  allow_gateway_transit     = true
+}
+```
+
+**Why:**
+- Spoke VNets are isolated from each other by default (zero trust).
+- All inter-spoke traffic can optionally route through Azure Firewall for inspection. [learn.microsoft](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/plan-for-landing-zone-network-segmentation)
+
+***
+
+### Step 8: Apply Network Security Groups (NSGs) for subnet-level micro-segmentation [learn.microsoft](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/plan-for-landing-zone-network-segmentation)
+
+```hcl
+resource "azurerm_network_security_group" "app_subnet" {
+  name                = "nsg-app-subnet"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  security_rule {
+    name                       = "deny-internet-inbound"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "Internet"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "allow-https-from-app-gateway"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "443"
+    source_address_prefix      = "10.0.4.0/24"  # App Gateway subnet
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_subnet_network_security_group_association" "app" {
+  subnet_id                 = azurerm_subnet.app.id
+  network_security_group_id = azurerm_network_security_group.app_subnet.id
+}
+```
+
+**Why:**
+- NSGs provide defense-in-depth at the subnet level. [learn.microsoft](https://learn.microsoft.com/en-us/azure/cloud-adoption-framework/ready/azure-best-practices/plan-for-landing-zone-network-segmentation)
+- Prevents lateral movement between subnets even if a workload is compromised.
+
+***
+
+## **Phase 4: Deploy Multi-Region Azure Red Hat OpenShift (ARO)**
+
+### Step 9: Provision ARO clusters in multiple regions [learn.microsoft](https://learn.microsoft.com/en-us/azure/aks/reliability-multi-region-deployment-models)
+
+```hcl
+# modules/aro-cluster/main.tf
+resource "azurerm_redhat_openshift_cluster" "aro" {
+  name                = var.cluster_name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  cluster_profile {
+    domain          = var.domain
+    version         = "4.14.0"
+    resource_group_id = var.cluster_resource_group_id
+  }
+
+  network_profile {
+    pod_cidr     = "10.128.0.0/14"
+    service_cidr = "172.30.0.0/16"
+  }
+
+  api_server_profile {
+    visibility = "Private"  # No public API endpoint
+  }
+
+  ingress_profile {
+    visibility = "Private"  # No public ingress
+  }
+
+  master_profile {
+    subnet_id      = var.master_subnet_id
+    vm_size        = "Standard_D8s_v3"
+  }
+
+  worker_profile {
+    subnet_id      = var.worker_subnet_id
+    vm_size        = "Standard_D4s_v3"
+    disk_size_gb   = 128
+    node_count     = 3
+  }
+
+  service_principal {
+    client_id     = var.sp_client_id
+    client_secret = var.sp_client_secret
+  }
+}
+```
+
+**Why:**
+- Private API and ingress prevent unauthorized access.
+- Multiple regions provide disaster recovery and geo-distribution. [linkedin](https://www.linkedin.com/pulse/designing-multi-region-disaster-recovery-architecture-yasir-imran-ljqpf)
+
+***
+
+### Step 10: Configure private DNS zones for private endpoint resolution
+
+```hcl
+resource "azurerm_private_dns_zone" "openshift_api" {
+  name                = "api.${var.domain}.openshift.com"
+  resource_group_name = var.resource_group_name
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "hub" {
+  name                  = "link-to-hub"
+  resource_group_name   = var.resource_group_name
+  private_dns_zone_name = azurerm_private_dns_zone.openshift_api.name
+  virtual_network_id    = var.hub_vnet_id
+}
+```
+
+**Why:**
+- Private DNS ensures internal services can resolve OpenShift API endpoints without public DNS.
+
+***
+
+### Step 11: Set up Azure Traffic Manager for multi-region failover [linkedin](https://www.linkedin.com/pulse/designing-multi-region-disaster-recovery-architecture-yasir-imran-ljqpf)
+
+```hcl
+resource "azurerm_traffic_manager_profile" "openshift" {
+  name                   = "tm-openshift-global"
+  resource_group_name    = var.resource_group_name
+  traffic_routing_method = "Priority"  # Failover mode
+
+  dns_config {
+    relative_name = "openshift-global"
+    ttl           = 30
+  }
+
+  monitor_config {
+    protocol = "HTTPS"
+    port     = 443
+    path     = "/healthz"
+  }
+}
+
+resource "azurerm_traffic_manager_endpoint" "primary" {
+  name                = "aro-eastus"
+  resource_group_name = var.resource_group_name
+  profile_name        = azurerm_traffic_manager_profile.openshift.name
+  type                = "azureEndpoints"
+  target_resource_id  = azurerm_public_ip.aro_ingress_eastus.id
+  priority            = 1
+}
+
+resource "azurerm_traffic_manager_endpoint" "secondary" {
+  name                = "aro-westus"
+  resource_group_name = var.resource_group_name
+  profile_name        = azurerm_traffic_manager_profile.openshift.name
+  type                = "azureEndpoints"
+  target_resource_id  = azurerm_public_ip.aro_ingress_westus.id
+  priority            = 2
+}
+```
+
+**Why:**
+- Traffic Manager provides automated DNS-based failover between regions. [linkedin](https://www.linkedin.com/pulse/designing-multi-region-disaster-recovery-architecture-yasir-imran-ljqpf)
+
+***
+
+## **Phase 5: Implement Governance and Security**
+
+### Step 12: Deploy custom Azure Policies for finance domain compliance [learn.microsoft](https://learn.microsoft.com/en-us/azure/governance/policy/overview)
+
+**Example: Deny public endpoints for storage accounts**
+
+```hcl
+# modules/azure-policy/deny-public-storage.tf
+resource "azurerm_policy_definition" "deny_public_storage" {
+  name         = "deny-public-storage-accounts"
+  policy_type  = "Custom"
+  mode         = "All"
+  display_name = "Deny Storage Accounts with Public Access"
+
+  policy_rule = jsonencode({
+    if = {
+      allOf = [
+        {
+          field  = "type"
+          equals = "Microsoft.Storage/storageAccounts"
+        },
+        {
+          field  = "Microsoft.Storage/storageAccounts/allowBlobPublicAccess"
+          equals = "true"
+        }
+      ]
+    }
+    then = {
+      effect = "deny"
+    }
+  })
+}
+
+resource "azurerm_policy_assignment" "deny_public_storage" {
+  name                 = "assign-deny-public-storage"
+  scope                = var.management_group_id
+  policy_definition_id = azurerm_policy_definition.deny_public_storage.id
+}
+```
+
+**Other policies to deploy:**
+- Require encryption in transit (HTTPS only).
+- Deny resources outside approved regions.
+- Require specific tags (cost center, owner, environment).
+- Audit or deny public IPs on VMs. [azure.microsoft](https://azure.microsoft.com/en-in/products/azure-policy)
+
+**Why:**
+- Preventive controls stop misconfigurations before they happen.
+- Audit policies track compliance for regulatory reporting. [learn.microsoft](https://learn.microsoft.com/en-us/azure/governance/policy/overview)
+
+***
+
+### Step 13: Configure RBAC at subscription and resource group level
+
+```hcl
+resource "azurerm_role_assignment" "platform_team" {
+  scope                = var.subscription_id
+  role_definition_name = "Contributor"
+  principal_id         = var.platform_team_group_id
+}
+
+resource "azurerm_role_assignment" "app_team_reader" {
+  scope                = azurerm_resource_group.spoke.id
+  role_definition_name = "Reader"
+  principal_id         = var.app_team_group_id
+}
+```
+
+**Why:**
+- Least privilege principle: teams only get access they need.
+- Platform team manages networking and policies; app teams deploy workloads.
+
+***
+
+## **Phase 6: Set Up Terraform Remote State Management** [medium](https://medium.com/@aderixxe/managing-terraform-state-remotely-azure-aws-backends-128c4a03ca08)
+
+### Step 14: Create Azure Storage Account for Terraform state
+
+```hcl
+# bootstrap/backend.tf
+resource "azurerm_storage_account" "tfstate" {
+  name                     = "sttfstate${var.environment}"
+  resource_group_name      = var.resource_group_name
+  location                 = var.location
+  account_tier             = "Standard"
+  account_replication_type = "GRS"  # Geo-redundant for DR
+
+  blob_properties {
+    versioning_enabled = true  # State file versioning
+  }
+}
+
+resource "azurerm_storage_container" "tfstate" {
+  name                  = "tfstate"
+  storage_account_name  = azurerm_storage_account.tfstate.name
+  container_access_type = "private"
+}
+```
+
+**Why:**
+- Remote state enables team collaboration.
+- State locking prevents concurrent modifications.
+- Versioning allows rollback if needed. [medium](https://medium.com/@aderixxe/managing-terraform-state-remotely-azure-aws-backends-128c4a03ca08)
+
+***
+
+### Step 15: Configure Terraform backend in each module
+
+```hcl
+# modules/hub-network/backend.tf
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "rg-terraform-state"
+    storage_account_name = "sttfstateprod"
+    container_name       = "tfstate"
+    key                  = "hub-network.tfstate"
+  }
+}
+```
+
+**Initialize with backend config:**
+
+```bash
+terraform init \
+  -backend-config="resource_group_name=rg-terraform-state" \
+  -backend-config="storage_account_name=sttfstateprod" \
+  -backend-config="container_name=tfstate" \
+  -backend-config="key=hub-network.tfstate"
+```
+
+**Why:**
+- Separate state files per module reduce blast radius.
+- Teams can work on different modules without blocking each other. [reddit](https://www.reddit.com/r/Terraform/comments/koz2ey/best_practice_for_remote_state_file_storage_in/)
+
+***
+
+## **Phase 7: Build Azure DevOps CI/CD Pipelines**
+
+### Step 16: Create YAML pipeline for Terraform deployment
+
+```yaml
+# azure-pipelines.yml
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/hub-network/**
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: terraform-vars  # Variable group with SP credentials
+
+stages:
+  - stage: Plan
+    jobs:
+      - job: TerraformPlan
+        steps:
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '1.9.0'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/hub-network'
+              backendServiceArm: 'sp-terraform-backend'
+              backendAzureRmResourceGroupName: 'rg-terraform-state'
+              backendAzureRmStorageAccountName: 'sttfstateprod'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'hub-network.tfstate'
+
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/hub-network'
+              environmentServiceNameAzureRM: 'sp-terraform-deploy'
+              commandOptions: '-out=tfplan'
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(System.DefaultWorkingDirectory)/terraform/hub-network/tfplan'
+              artifact: 'tfplan'
+
+  - stage: Apply
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: TerraformApply
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: tfplan
+
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: '$(Pipeline.Workspace)/tfplan'
+                    environmentServiceNameAzureRM: 'sp-terraform-deploy'
+                    commandOptions: 'tfplan'
+```
+
+**Why:**
+- Plan stage runs on every PR for review.
+- Apply stage only runs on main branch after approval.
+- Separate service principals for backend (read state) vs. deploy (write resources).
+
+***
+
+### Step 17: Manage service principal expiry and rotation
+
+**Set up monitoring for SP expiry:**
+
+```bash
+# Check SP credential expiry
+az ad sp credential list --id <sp-object-id> --query "[].endDateTime" -o table
+```
+
+**Automate rotation with Azure DevOps pipeline:**
+
+```yaml
+# rotate-sp-secret.yml
+trigger: none
+
+schedules:
+  - cron: "0 0 1 * *"  # Monthly
+    displayName: Rotate SP Secret
+    branches:
+      include:
+        - main
+
+steps:
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: 'sp-admin'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        # Reset SP credential
+        NEW_SECRET=$(az ad sp credential reset --id $(SP_CLIENT_ID) --query password -o tsv)
+        
+        # Update Azure DevOps service connection
+        echo "##vso[task.setvariable variable=NEW_SECRET;issecret=true]$NEW_SECRET"
+
+  - task: AzureCLI@2
+    inputs:
+      scriptType: 'bash'
+      inlineScript: |
+        # Update KeyVault with new secret
+        az keyvault secret set --vault-name kv-platform-prod \
+          --name sp-terraform-secret \
+          --value "$(NEW_SECRET)"
+```
+
+**Why:**
+- Service principals expire by default (avoid authentication failures).
+- Automated rotation reduces manual overhead and security risk.
+
+***
+
+## **Phase 8: Cost Optimization and FinOps**
+
+### Step 18: Implement Azure Cost Management + Budgets
+
+```hcl
+resource "azurerm_consumption_budget_subscription" "platform" {
+  name            = "budget-platform-monthly"
+  subscription_id = var.subscription_id
+
+  amount     = 50000  # 50K GBP
+  time_grain = "Monthly"
+
+  time_period {
+    start_date = "2026-06-01T00:00:00Z"
+  }
+
+  notification {
+    enabled   = true
+    threshold = 80
+    operator  = "GreaterThan"
+
+    contact_emails = [
+      "platform-team@company.com"
+    ]
+  }
+
+  notification {
+    enabled   = true
+    threshold = 100
+    operator  = "GreaterThan"
+
+    contact_emails = [
+      "platform-team@company.com",
+      "finance@company.com"
+    ]
+  }
+}
+```
+
+**Why:**
+- Budgets alert before overspend.
+- Finance teams get visibility into cloud costs.
+
+***
+
+### Step 19: Right-size VMs and implement auto-shutdown
+
+```hcl
+resource "azurerm_dev_test_global_vm_shutdown_schedule" "nonprod" {
+  virtual_machine_id = azurerm_linux_virtual_machine.nonprod.id
+  location           = var.location
+  enabled            = true
+
+  daily_recurrence_time = "1900"
+  timezone              = "UTC"
+
+  notification_settings {
+    enabled = false
+  }
+}
+```
+
+**Why:**
+- Non-prod environments don't need to run 24/7.
+- Can save 40-60% on VM costs.
+
+***
+
+## **Phase 9: Observability and Monitoring**
+
+### Step 20: Deploy Azure Monitor and Log Analytics
+
+```hcl
+resource "azurerm_log_analytics_workspace" "platform" {
+  name                = "law-platform-prod"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+}
+
+resource "azurerm_monitor_diagnostic_setting" "firewall" {
+  name                       = "diag-firewall"
+  target_resource_id         = azurerm_firewall.hub.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.platform.id
+
+  enabled_log {
+    category = "AzureFirewallApplicationRule"
+  }
+
+  enabled_log {
+    category = "AzureFirewallNetworkRule"
+  }
+
+  metric {
+    category = "AllMetrics"
+  }
+}
+```
+
+**Why:**
+- Centralised logging for compliance and troubleshooting.
+- Alerts on security events (blocked traffic, policy violations).
+
+***
+
+## **Summary: What You Built**
+
+| **Component** | **Purpose** |
+|---|---|
+| Hub-Spoke VNets | Network isolation + centralized security |
+| Azure Firewall | Egress filtering + threat protection |
+| Private Endpoints | Secure PaaS access without public internet |
+| Multi-region ARO | High availability + disaster recovery |
+| Custom Azure Policies | Compliance enforcement (finance domain) |
+| Modular Terraform | Reusable, testable infrastructure code |
+| Remote State | Team collaboration + audit trail |
+| Azure DevOps Pipelines | Automated deployment + approval gates |
+| Cost Monitoring | Budget alerts + right-sizing |
+| Centralized Logging | Security visibility + compliance |
+
+***
+
+## **Key Enterprise Architect Principles Applied**
+
+1. **Security by default**: Private networking, NSGs, policies enforce compliance from day one.
+2. **Least privilege**: RBAC limits access; teams are autonomous within guardrails.
+3. **Repeatability**: Terraform modules + pipelines make infrastructure code auditable and versionable.
+4. **Resilience**: Multi-region ARO + Traffic Manager ensure failover capability.
+5. **Cost governance**: Budgets, right-sizing, and auto-shutdown prevent waste.
+6. **Observability**: Centralised logging and monitoring detect issues early.
+
+***
